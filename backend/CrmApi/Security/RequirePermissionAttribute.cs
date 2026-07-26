@@ -6,7 +6,7 @@ using Microsoft.EntityFrameworkCore;
 
 namespace CrmApi.Security;
 
-public enum PermAction { View, Create, Edit, Delete }
+public enum PermAction { View, Create, Edit, Delete, Export }
 
 /// <summary>
 /// Server-side authority check. The frontend hides menus, but every
@@ -26,8 +26,8 @@ public class RequirePermissionAttribute(string moduleKey, PermAction action)
             return;
         }
 
-        var roleIdClaim = user.FindFirst("roleId")?.Value;
-        if (!int.TryParse(roleIdClaim, out var roleId))
+        var userIdClaim = user.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+        if (!int.TryParse(userIdClaim, out var userId))
         {
             context.Result = new ForbidResult();
             return;
@@ -35,10 +35,11 @@ public class RequirePermissionAttribute(string moduleKey, PermAction action)
 
         var db = context.HttpContext.RequestServices.GetRequiredService<CrmDbContext>();
 
-        var perm = await db.RolePermissions
+        // Authority is per-user (UserPermissions), not per-role.
+        var perm = await db.UserPermissions
             .AsNoTracking()
-            .Where(p => p.RoleId == roleId && p.Module!.ModuleKey == moduleKey)
-            .Select(p => new { p.CanView, p.CanCreate, p.CanEdit, p.CanDelete })
+            .Where(p => p.UserId == userId && p.Module!.ModuleKey == moduleKey)
+            .Select(p => new { p.CanView, p.CanCreate, p.CanEdit, p.CanDelete, p.CanExport })
             .FirstOrDefaultAsync();
 
         var allowed = action switch
@@ -47,6 +48,7 @@ public class RequirePermissionAttribute(string moduleKey, PermAction action)
             PermAction.Create => perm?.CanCreate,
             PermAction.Edit => perm?.CanEdit,
             PermAction.Delete => perm?.CanDelete,
+            PermAction.Export => perm?.CanExport,
             _ => false
         } ?? false;
 

@@ -1,4 +1,4 @@
-# Estate CRM
+# Real Monk Reality — CRM
 
 Real-estate lead & client management. Three folders, kept separate for clarity:
 

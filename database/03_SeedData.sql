@@ -20,7 +20,9 @@ INSERT INTO dbo.Modules (ModuleKey, ModuleName, SortOrder) VALUES
  ('leads',     'Leads',       2),
  ('clients',   'Clients',     3),
  ('pending',   'Pending',     4),
- ('users',     'User Master', 5);
+ ('users',     'User Master', 5),
+ ('assistant', 'Assistant',   6),
+ ('sitevisits','Site Visits',  7);
 GO
 
 /* ---------- Role permissions ---------- */
@@ -29,32 +31,34 @@ DECLARE @Mgr   INT = (SELECT RoleId FROM dbo.Roles WHERE RoleName='Manager');
 DECLARE @Agent INT = (SELECT RoleId FROM dbo.Roles WHERE RoleName='Agent');
 DECLARE @View  INT = (SELECT RoleId FROM dbo.Roles WHERE RoleName='Viewer');
 
--- Admin: everything on every module
-INSERT INTO dbo.RolePermissions (RoleId, ModuleId, CanView, CanCreate, CanEdit, CanDelete)
-SELECT @Admin, ModuleId, 1,1,1,1 FROM dbo.Modules;
+-- Admin: everything on every module (export included)
+INSERT INTO dbo.RolePermissions (RoleId, ModuleId, CanView, CanCreate, CanEdit, CanDelete, CanExport)
+SELECT @Admin, ModuleId, 1,1,1,1,1 FROM dbo.Modules;
 
--- Manager: all lead modules fully, dashboard view, no user master
-INSERT INTO dbo.RolePermissions (RoleId, ModuleId, CanView, CanCreate, CanEdit, CanDelete)
+-- Manager: all lead modules fully, dashboard view, can export, no user master
+INSERT INTO dbo.RolePermissions (RoleId, ModuleId, CanView, CanCreate, CanEdit, CanDelete, CanExport)
 SELECT @Mgr, ModuleId,
        1,
        CASE WHEN ModuleKey IN ('leads','clients','pending') THEN 1 ELSE 0 END,
        CASE WHEN ModuleKey IN ('leads','clients','pending') THEN 1 ELSE 0 END,
-       CASE WHEN ModuleKey IN ('leads') THEN 1 ELSE 0 END
+       CASE WHEN ModuleKey IN ('leads') THEN 1 ELSE 0 END,
+       1
 FROM dbo.Modules WHERE ModuleKey <> 'users';
 
--- Agent: create/edit leads, view clients & pending, no delete, no user master
-INSERT INTO dbo.RolePermissions (RoleId, ModuleId, CanView, CanCreate, CanEdit, CanDelete)
+-- Agent: create/edit leads, view clients & pending, no delete/export, no user master, no assistant
+INSERT INTO dbo.RolePermissions (RoleId, ModuleId, CanView, CanCreate, CanEdit, CanDelete, CanExport)
 SELECT @Agent, ModuleId,
        1,
        CASE WHEN ModuleKey = 'leads' THEN 1 ELSE 0 END,
        CASE WHEN ModuleKey IN ('leads','pending') THEN 1 ELSE 0 END,
+       0,
        0
-FROM dbo.Modules WHERE ModuleKey <> 'users';
+FROM dbo.Modules WHERE ModuleKey NOT IN ('users','assistant');
 
--- Viewer: view only
-INSERT INTO dbo.RolePermissions (RoleId, ModuleId, CanView, CanCreate, CanEdit, CanDelete)
-SELECT @View, ModuleId, 1, 0, 0, 0
-FROM dbo.Modules WHERE ModuleKey <> 'users';
+-- Viewer: view only, no export, no assistant
+INSERT INTO dbo.RolePermissions (RoleId, ModuleId, CanView, CanCreate, CanEdit, CanDelete, CanExport)
+SELECT @View, ModuleId, 1, 0, 0, 0, 0
+FROM dbo.Modules WHERE ModuleKey NOT IN ('users','assistant');
 GO
 
 /* ---------- Users (password = Admin@123) ----------
@@ -71,6 +75,14 @@ INSERT INTO dbo.Users (FullName, Email, Username, PasswordHash, Phone, RoleId, I
  ('Neha Gupta',          'neha@crm.local', 'neha',    @Hash,'9876500005',(SELECT RoleId FROM dbo.Roles WHERE RoleName='Viewer'), 1);
 GO
 
+/* ---------- Seed each user's module permissions from their role's defaults ----------
+   Authority is per-user; this just gives each seeded user a sensible starting set. */
+INSERT INTO dbo.UserPermissions (UserId, ModuleId, CanView, CanCreate, CanEdit, CanDelete, CanExport)
+SELECT u.UserId, rp.ModuleId, rp.CanView, rp.CanCreate, rp.CanEdit, rp.CanDelete, rp.CanExport
+FROM dbo.Users u
+JOIN dbo.RolePermissions rp ON rp.RoleId = u.RoleId;
+GO
+
 /* ---------- Lookups ---------- */
 INSERT INTO dbo.Sources (SourceName) VALUES
  ('Walk-in'),('Website'),('Referral'),('Facebook Ads'),('Google Ads'),
@@ -84,6 +96,20 @@ INSERT INTO dbo.Projects (ProjectName, City) VALUES
  ('Metro Business Park','Pune'),
  ('Riverdale Enclave','Nagpur'),
  ('Sunrise Apartments','Indore');
+GO
+
+INSERT INTO dbo.PropertyTypes (TypeName) VALUES
+ ('Apartment'),('Villa'),('Plot'),('Commercial'),
+ ('Bungalow'),('Penthouse'),('Office Space'),('Shop');
+GO
+
+INSERT INTO dbo.Areas (AreaName, City) VALUES
+ ('Vijay Nagar','Indore'),('Scheme 78','Indore'),('Palasia','Indore'),('Bhawarkua','Indore'),('Rau','Indore'),
+ ('MP Nagar','Bhopal'),('Arera Colony','Bhopal'),('Kolar Road','Bhopal'),
+ ('Kothrud','Pune'),('Hinjewadi','Pune'),('Baner','Pune'),
+ ('Dharampeth','Nagpur'),('Sadar','Nagpur'),
+ ('Freeganj','Ujjain'),('Nanakheda','Ujjain'),
+ ('Wright Town','Jabalpur'),('Napier Town','Jabalpur');
 GO
 
 /* =============================================================

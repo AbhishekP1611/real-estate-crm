@@ -2,6 +2,7 @@ using CrmApi.Data;
 using CrmApi.Models;
 using CrmApi.Models.Dtos;
 using CrmApi.Security;
+using CrmApi.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -13,11 +14,14 @@ namespace CrmApi.Controllers;
 ///   leads   -> everything
 ///   clients -> Status = Converted
 ///   pending -> Status in (New, Contacted, Qualified)
+///
+/// Every read is passed through ILeadScopeService, so a non-admin user only ever
+/// sees leads inside their assigned City / Area / PropertyType.
 /// </summary>
 [ApiController]
 [Route("api/leads")]
 [Authorize]
-public class LeadsController(CrmDbContext db) : ControllerBase
+public class LeadsController(CrmDbContext db, ILeadScopeService scope) : ControllerBase
 {
     [HttpGet]
     public async Task<ActionResult<PagedResult<LeadDto>>> Search(
@@ -45,6 +49,14 @@ public class LeadsController(CrmDbContext db) : ControllerBase
         pageSize = Math.Clamp(pageSize, 1, 200);
 
         var q = db.Leads.AsNoTracking().Where(l => l.IsActive);
+        q = await scope.ApplyAsync(q, User.GetUserId(), User.GetRoleId());
+
+        // Agent restriction (Leads grid only): if this user has chosen agents,
+        // limit the grid to leads assigned to any of them. Empty = no limit.
+        var allowedAgents = await db.UserAgents.AsNoTracking()
+            .Where(x => x.UserId == User.GetUserId()).Select(x => x.AgentUserId).ToListAsync();
+        if (allowedAgents.Count > 0)
+            q = q.Where(l => l.AssignedToUserId != null && allowedAgents.Contains(l.AssignedToUserId.Value));
 
         q = moduleKey switch
         {
@@ -101,7 +113,7 @@ public class LeadsController(CrmDbContext db) : ControllerBase
         };
 
         var items = await q.Skip((page - 1) * pageSize).Take(pageSize)
-            .Include(l => l.Source).Include(l => l.Project).Include(l => l.AssignedToUser)
+            .Include(l => l.Source).Include(l => l.Project).Include(l => l.Area).Include(l => l.AssignedToUser)
             .Select(l => Map(l)).ToListAsync();
 
         return Ok(new PagedResult<LeadDto>
@@ -115,9 +127,12 @@ public class LeadsController(CrmDbContext db) : ControllerBase
     {
         if (!await HasView("leads")) return Forbid();
 
-        var lead = await db.Leads.AsNoTracking()
-            .Where(l => l.LeadId == id && l.IsActive)
-            .Include(l => l.Source).Include(l => l.Project).Include(l => l.AssignedToUser)
+        var scoped = await scope.ApplyAsync(
+            db.Leads.AsNoTracking().Where(l => l.IsActive), User.GetUserId(), User.GetRoleId());
+
+        var lead = await scoped
+            .Where(l => l.LeadId == id)
+            .Include(l => l.Source).Include(l => l.Project).Include(l => l.Area).Include(l => l.AssignedToUser)
             .Select(l => Map(l)).FirstOrDefaultAsync();
 
         return lead is null ? NotFound(new { message = $"Lead {id} was not found." }) : Ok(lead);
@@ -127,6 +142,12 @@ public class LeadsController(CrmDbContext db) : ControllerBase
     public async Task<ActionResult<List<LeadHistoryDto>>> History(int id)
     {
         if (!await HasView("leads")) return Forbid();
+
+        // Only expose history for a lead the caller is actually allowed to see.
+        var scoped = await scope.ApplyAsync(
+            db.Leads.AsNoTracking().Where(l => l.IsActive), User.GetUserId(), User.GetRoleId());
+        if (!await scoped.AnyAsync(l => l.LeadId == id))
+            return NotFound(new { message = $"Lead {id} was not found." });
 
         var rows = await db.LeadStatusHistories.AsNoTracking()
             .Where(h => h.LeadId == id)
@@ -166,6 +187,7 @@ public class LeadsController(CrmDbContext db) : ControllerBase
             Address = req.Address,
             SourceId = req.SourceId,
             ProjectId = req.ProjectId,
+            AreaId = req.AreaId,
             PropertyType = req.PropertyType,
             Budget = req.Budget,
             Notes = req.Notes,
@@ -190,7 +212,7 @@ public class LeadsController(CrmDbContext db) : ControllerBase
         await db.SaveChangesAsync();
 
         var dto = await db.Leads.AsNoTracking().Where(l => l.LeadId == lead.LeadId)
-            .Include(l => l.Source).Include(l => l.Project).Include(l => l.AssignedToUser)
+            .Include(l => l.Source).Include(l => l.Project).Include(l => l.Area).Include(l => l.AssignedToUser)
             .Select(l => Map(l)).FirstAsync();
 
         return CreatedAtAction(nameof(GetById), new { id = lead.LeadId }, dto);
@@ -203,7 +225,7 @@ public class LeadsController(CrmDbContext db) : ControllerBase
         if (!LeadStatus.IsValid(req.Status))
             return BadRequest(new { message = $"Status must be one of: {string.Join(", ", LeadStatus.All)}." });
 
-        var lead = await db.Leads.FirstOrDefaultAsync(l => l.LeadId == id && l.IsActive);
+        var lead = await LoadScopedLeadAsync(id);
         if (lead is null) return NotFound(new { message = $"Lead {id} was not found." });
 
         if (await db.Leads.AnyAsync(l => l.Phone == req.Phone && l.LeadId != id && l.IsActive))
@@ -219,6 +241,7 @@ public class LeadsController(CrmDbContext db) : ControllerBase
         lead.Address = req.Address;
         lead.SourceId = req.SourceId;
         lead.ProjectId = req.ProjectId;
+        lead.AreaId = req.AreaId;
         lead.PropertyType = req.PropertyType;
         lead.Budget = req.Budget;
         lead.Notes = req.Notes;
@@ -242,7 +265,7 @@ public class LeadsController(CrmDbContext db) : ControllerBase
         await db.SaveChangesAsync();
 
         var dto = await db.Leads.AsNoTracking().Where(l => l.LeadId == id)
-            .Include(l => l.Source).Include(l => l.Project).Include(l => l.AssignedToUser)
+            .Include(l => l.Source).Include(l => l.Project).Include(l => l.Area).Include(l => l.AssignedToUser)
             .Select(l => Map(l)).FirstAsync();
         return Ok(dto);
     }
@@ -255,7 +278,7 @@ public class LeadsController(CrmDbContext db) : ControllerBase
         if (!LeadStatus.IsValid(req.Status))
             return BadRequest(new { message = $"Status must be one of: {string.Join(", ", LeadStatus.All)}." });
 
-        var lead = await db.Leads.FirstOrDefaultAsync(l => l.LeadId == id && l.IsActive);
+        var lead = await LoadScopedLeadAsync(id);
         if (lead is null) return NotFound(new { message = $"Lead {id} was not found." });
 
         if (lead.Status == req.Status)
@@ -280,7 +303,7 @@ public class LeadsController(CrmDbContext db) : ControllerBase
         await db.SaveChangesAsync();
 
         var dto = await db.Leads.AsNoTracking().Where(l => l.LeadId == id)
-            .Include(l => l.Source).Include(l => l.Project).Include(l => l.AssignedToUser)
+            .Include(l => l.Source).Include(l => l.Project).Include(l => l.Area).Include(l => l.AssignedToUser)
             .Select(l => Map(l)).FirstAsync();
         return Ok(dto);
     }
@@ -289,7 +312,7 @@ public class LeadsController(CrmDbContext db) : ControllerBase
     [RequirePermission("leads", PermAction.Delete)]
     public async Task<IActionResult> Delete(int id)
     {
-        var lead = await db.Leads.FirstOrDefaultAsync(l => l.LeadId == id && l.IsActive);
+        var lead = await LoadScopedLeadAsync(id);
         if (lead is null) return NotFound(new { message = $"Lead {id} was not found." });
 
         // Soft delete keeps historical dashboard numbers intact.
@@ -342,9 +365,21 @@ public class LeadsController(CrmDbContext db) : ControllerBase
 
     private async Task<bool> HasView(string moduleKey)
     {
-        var roleId = User.GetRoleId();
-        return await db.RolePermissions.AsNoTracking()
-            .AnyAsync(p => p.RoleId == roleId && p.Module!.ModuleKey == moduleKey && p.CanView);
+        var userId = User.GetUserId();
+        return await db.UserPermissions.AsNoTracking()
+            .AnyAsync(p => p.UserId == userId && p.Module!.ModuleKey == moduleKey && p.CanView);
+    }
+
+    /// <summary>
+    /// Loads a lead for writing, but only if it is inside the caller's data scope.
+    /// Returns null (treat as not-found) when the lead doesn't exist OR is out of scope,
+    /// so a user can never edit a lead they aren't allowed to see.
+    /// </summary>
+    private async Task<Lead?> LoadScopedLeadAsync(int id)
+    {
+        var scoped = await scope.ApplyAsync(
+            db.Leads.Where(l => l.IsActive), User.GetUserId(), User.GetRoleId());
+        return await scoped.FirstOrDefaultAsync(l => l.LeadId == id);
     }
 
     private static LeadDto Map(Lead l) => new()
@@ -360,6 +395,8 @@ public class LeadsController(CrmDbContext db) : ControllerBase
         SourceName = l.Source != null ? l.Source.SourceName : null,
         ProjectId = l.ProjectId,
         ProjectName = l.Project != null ? l.Project.ProjectName : null,
+        AreaId = l.AreaId,
+        AreaName = l.Area != null ? l.Area.AreaName : null,
         PropertyType = l.PropertyType,
         Budget = l.Budget,
         DealValue = l.DealValue,

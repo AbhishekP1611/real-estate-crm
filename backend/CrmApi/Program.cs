@@ -22,6 +22,7 @@ if (string.IsNullOrWhiteSpace(jwt.Key) || jwt.Key.Length < 32)
 
 builder.Services.AddSingleton(jwt);
 builder.Services.AddScoped<ITokenService, TokenService>();
+builder.Services.AddScoped<ILeadScopeService, LeadScopeService>();
 
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddJwtBearer(options =>

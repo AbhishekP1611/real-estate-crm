@@ -18,12 +18,21 @@ GO
 /* ---------- Drop in dependency order (safe re-run) ---------- */
 IF OBJECT_ID('dbo.LeadStatusHistory','U') IS NOT NULL DROP TABLE dbo.LeadStatusHistory;
 IF OBJECT_ID('dbo.Leads','U')             IS NOT NULL DROP TABLE dbo.Leads;
+IF OBJECT_ID('dbo.UserCities','U')        IS NOT NULL DROP TABLE dbo.UserCities;
+IF OBJECT_ID('dbo.UserAreas','U')         IS NOT NULL DROP TABLE dbo.UserAreas;
+IF OBJECT_ID('dbo.UserPropertyTypes','U') IS NOT NULL DROP TABLE dbo.UserPropertyTypes;
+IF OBJECT_ID('dbo.UserAgents','U')        IS NOT NULL DROP TABLE dbo.UserAgents;
+IF OBJECT_ID('dbo.VisitPoints','U')       IS NOT NULL DROP TABLE dbo.VisitPoints;
+IF OBJECT_ID('dbo.SiteVisits','U')        IS NOT NULL DROP TABLE dbo.SiteVisits;
+IF OBJECT_ID('dbo.UserPermissions','U')   IS NOT NULL DROP TABLE dbo.UserPermissions;
 IF OBJECT_ID('dbo.RolePermissions','U')   IS NOT NULL DROP TABLE dbo.RolePermissions;
 IF OBJECT_ID('dbo.Users','U')             IS NOT NULL DROP TABLE dbo.Users;
 IF OBJECT_ID('dbo.Roles','U')             IS NOT NULL DROP TABLE dbo.Roles;
 IF OBJECT_ID('dbo.Modules','U')           IS NOT NULL DROP TABLE dbo.Modules;
 IF OBJECT_ID('dbo.Sources','U')           IS NOT NULL DROP TABLE dbo.Sources;
 IF OBJECT_ID('dbo.Projects','U')          IS NOT NULL DROP TABLE dbo.Projects;
+IF OBJECT_ID('dbo.Areas','U')             IS NOT NULL DROP TABLE dbo.Areas;
+IF OBJECT_ID('dbo.PropertyTypes','U')     IS NOT NULL DROP TABLE dbo.PropertyTypes;
 GO
 
 /* ---------- Roles ---------- */
@@ -55,6 +64,7 @@ CREATE TABLE dbo.RolePermissions (
     CanCreate BIT NOT NULL DEFAULT 0,
     CanEdit   BIT NOT NULL DEFAULT 0,
     CanDelete BIT NOT NULL DEFAULT 0,
+    CanExport BIT NOT NULL DEFAULT 0,
     CONSTRAINT UQ_RolePermissions UNIQUE (RoleId, ModuleId)
 );
 GO
@@ -93,6 +103,109 @@ CREATE TABLE dbo.Projects (
 );
 GO
 
+/* ---------- Lookup: area (locality within a city) ---------- */
+CREATE TABLE dbo.Areas (
+    AreaId   INT IDENTITY(1,1) PRIMARY KEY,
+    AreaName NVARCHAR(100) NOT NULL UNIQUE,
+    City     NVARCHAR(60)  NULL,
+    IsActive BIT NOT NULL DEFAULT 1
+);
+GO
+
+/* ---------- Lookup: property type ---------- */
+CREATE TABLE dbo.PropertyTypes (
+    PropertyTypeId INT IDENTITY(1,1) PRIMARY KEY,
+    TypeName NVARCHAR(60) NOT NULL UNIQUE,
+    IsActive BIT NOT NULL DEFAULT 1
+);
+GO
+
+/* ---------- Per-user data scope ----------
+   A user only sees leads whose City / Area / PropertyType is in their assigned
+   set. An empty set means "sees nothing" - EXCEPT the Admin role, which the API
+   exempts entirely. Multiple values per user (tag-box selection).            */
+CREATE TABLE dbo.UserCities (
+    UserCityId INT IDENTITY(1,1) PRIMARY KEY,
+    UserId INT NOT NULL FOREIGN KEY REFERENCES dbo.Users(UserId) ON DELETE CASCADE,
+    City   NVARCHAR(60) NOT NULL,
+    CONSTRAINT UQ_UserCities UNIQUE(UserId, City)
+);
+GO
+
+CREATE TABLE dbo.UserAreas (
+    UserAreaId INT IDENTITY(1,1) PRIMARY KEY,
+    UserId INT NOT NULL FOREIGN KEY REFERENCES dbo.Users(UserId) ON DELETE CASCADE,
+    AreaId INT NOT NULL FOREIGN KEY REFERENCES dbo.Areas(AreaId),
+    CONSTRAINT UQ_UserAreas UNIQUE(UserId, AreaId)
+);
+GO
+
+CREATE TABLE dbo.UserPropertyTypes (
+    UserPropertyTypeId INT IDENTITY(1,1) PRIMARY KEY,
+    UserId INT NOT NULL FOREIGN KEY REFERENCES dbo.Users(UserId) ON DELETE CASCADE,
+    PropertyType NVARCHAR(60) NOT NULL,
+    CONSTRAINT UQ_UserPropertyTypes UNIQUE(UserId, PropertyType)
+);
+GO
+
+/* ---------- Which agents' assigned leads a user may see (Leads grid only) ----------
+   Empty = no agent restriction. When set, the Leads grid is limited to leads
+   assigned to any of the chosen agents (on top of the city/area/type scope).   */
+CREATE TABLE dbo.UserAgents (
+    UserAgentId INT IDENTITY(1,1) PRIMARY KEY,
+    UserId      INT NOT NULL FOREIGN KEY REFERENCES dbo.Users(UserId) ON DELETE CASCADE,
+    AgentUserId INT NOT NULL FOREIGN KEY REFERENCES dbo.Users(UserId),
+    CONSTRAINT UQ_UserAgents UNIQUE(UserId, AgentUserId)
+);
+GO
+
+/* ---------- Per-user module permissions (View/Create/Edit/Delete/Export) ----------
+   Authority is per USER, not per role. RolePermissions still exists so a new user
+   can be seeded from a role's defaults, but access checks read UserPermissions.  */
+CREATE TABLE dbo.UserPermissions (
+    UserPermissionId INT IDENTITY(1,1) PRIMARY KEY,
+    UserId    INT NOT NULL FOREIGN KEY REFERENCES dbo.Users(UserId) ON DELETE CASCADE,
+    ModuleId  INT NOT NULL FOREIGN KEY REFERENCES dbo.Modules(ModuleId),
+    CanView   BIT NOT NULL DEFAULT 0,
+    CanCreate BIT NOT NULL DEFAULT 0,
+    CanEdit   BIT NOT NULL DEFAULT 0,
+    CanDelete BIT NOT NULL DEFAULT 0,
+    CanExport BIT NOT NULL DEFAULT 0,
+    CONSTRAINT UQ_UserPermissions UNIQUE(UserId, ModuleId)
+);
+GO
+
+/* ---------- Site visits: agent goes to show a lead a property, tracked live ---------- */
+CREATE TABLE dbo.SiteVisits (
+    VisitId       INT IDENTITY(1,1) PRIMARY KEY,
+    AgentUserId   INT NOT NULL FOREIGN KEY REFERENCES dbo.Users(UserId),
+    LeadId        INT NOT NULL FOREIGN KEY REFERENCES dbo.Leads(LeadId),
+    Status        NVARCHAR(20) NOT NULL DEFAULT 'Ongoing',  -- Ongoing | Completed | Cancelled
+    StartLat      DECIMAL(9,6) NULL,
+    StartLng      DECIMAL(9,6) NULL,
+    EndLat        DECIMAL(9,6) NULL,
+    EndLng        DECIMAL(9,6) NULL,
+    Purpose       NVARCHAR(300) NULL,
+    Remark        NVARCHAR(500) NULL,
+    StartedAt     DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    CompletedAt   DATETIME2 NULL
+);
+CREATE INDEX IX_SiteVisits_Agent  ON dbo.SiteVisits(AgentUserId);
+CREATE INDEX IX_SiteVisits_Status ON dbo.SiteVisits(Status);
+GO
+
+/* ---------- Breadcrumb points captured during a visit (the moving path) ---------- */
+CREATE TABLE dbo.VisitPoints (
+    PointId    INT IDENTITY(1,1) PRIMARY KEY,
+    VisitId    INT NOT NULL FOREIGN KEY REFERENCES dbo.SiteVisits(VisitId) ON DELETE CASCADE,
+    Lat        DECIMAL(9,6) NOT NULL,
+    Lng        DECIMAL(9,6) NOT NULL,
+    Accuracy   DECIMAL(9,2) NULL,
+    RecordedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+);
+CREATE INDEX IX_VisitPoints_Visit ON dbo.VisitPoints(VisitId);
+GO
+
 /* ---------- Leads (single table drives Leads / Clients / Pending tabs) ---------- */
 CREATE TABLE dbo.Leads (
     LeadId         INT IDENTITY(1,1) PRIMARY KEY,
@@ -106,8 +219,9 @@ CREATE TABLE dbo.Leads (
 
     SourceId       INT NULL FOREIGN KEY REFERENCES dbo.Sources(SourceId),
     ProjectId      INT NULL FOREIGN KEY REFERENCES dbo.Projects(ProjectId),
+    AreaId         INT NULL FOREIGN KEY REFERENCES dbo.Areas(AreaId),
 
-    PropertyType   NVARCHAR(40)  NULL,   -- Apartment / Villa / Plot / Commercial
+    PropertyType   NVARCHAR(60)  NULL,   -- free text; also picked from PropertyTypes lookup
     Budget         DECIMAL(18,2) NULL,
     DealValue      DECIMAL(18,2) NULL,   -- filled when converted
 

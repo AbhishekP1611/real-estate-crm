@@ -86,9 +86,10 @@ public class AuthController(CrmDbContext db, ITokenService tokens) : ControllerB
         var user = await db.Users.Include(u => u.Role).AsNoTracking()
             .FirstAsync(u => u.UserId == userId);
 
-        var perms = await db.RolePermissions
+        // Menu + capabilities come from the user's own permissions, not their role.
+        var perms = await db.UserPermissions
             .Include(p => p.Module)
-            .Where(p => p.RoleId == user.RoleId)
+            .Where(p => p.UserId == user.UserId)
             .AsNoTracking()
             .OrderBy(p => p.Module!.SortOrder)
             .Select(p => new ModulePermissionDto
@@ -100,7 +101,8 @@ public class AuthController(CrmDbContext db, ITokenService tokens) : ControllerB
                 CanView = p.CanView,
                 CanCreate = p.CanCreate,
                 CanEdit = p.CanEdit,
-                CanDelete = p.CanDelete
+                CanDelete = p.CanDelete,
+                CanExport = p.CanExport
             })
             .ToListAsync();
 

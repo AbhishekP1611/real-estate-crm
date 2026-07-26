@@ -3,6 +3,7 @@ using CrmApi.Data;
 using CrmApi.Models;
 using CrmApi.Models.Dtos;
 using CrmApi.Security;
+using CrmApi.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -12,8 +13,13 @@ namespace CrmApi.Controllers;
 [ApiController]
 [Route("api/dashboard")]
 [Authorize]
-public class DashboardController(CrmDbContext db) : ControllerBase
+public class DashboardController(CrmDbContext db, ILeadScopeService scope) : ControllerBase
 {
+    /// <summary>Active leads the caller is allowed to see - every dashboard query builds on this.</summary>
+    private Task<IQueryable<Lead>> ScopedLeadsAsync() =>
+        scope.ApplyAsync(db.Leads.AsNoTracking().Where(l => l.IsActive),
+                         User.GetUserId(), User.GetRoleId());
+
     /// <summary>
     /// Dashboard for a period. Either pass explicit fromDate/toDate, or pass
     /// year (+ optional month) and the range is derived. Default is the current month.
@@ -56,17 +62,19 @@ public class DashboardController(CrmDbContext db) : ControllerBase
         if (from > to)
             return BadRequest(new { message = "fromDate cannot be after toDate." });
 
-        var summary = await BuildSummary(from, to);
+        var baseQuery = await ScopedLeadsAsync();
+
+        var summary = await BuildSummary(baseQuery, from, to);
 
         // Trend: the month `to` falls in, plus the previous 5 months.
         var trendEnd = new DateOnly(to.Year, to.Month, 1);
         var trendStart = trendEnd.AddMonths(-5);
-        var trend = await BuildTrend(trendStart, trendEnd);
+        var trend = await BuildTrend(baseQuery, trendStart, trendEnd);
 
-        var scoped = db.Leads.AsNoTracking().Where(l => l.IsActive
-            && ((l.LeadDate >= from && l.LeadDate <= to)
-                || (l.ConvertedDate >= from && l.ConvertedDate <= to)
-                || (l.RejectedDate >= from && l.RejectedDate <= to)));
+        var scoped = baseQuery.Where(l =>
+            (l.LeadDate >= from && l.LeadDate <= to)
+            || (l.ConvertedDate >= from && l.ConvertedDate <= to)
+            || (l.RejectedDate >= from && l.RejectedDate <= to));
 
         var bySource = await scoped
             .GroupBy(l => l.Source != null ? l.Source.SourceName : "Unknown")
@@ -83,8 +91,8 @@ public class DashboardController(CrmDbContext db) : ControllerBase
             .Select(g => new LookupCountDto { Name = g.Key, Count = g.Count(), Value = g.Sum(x => x.DealValue ?? 0) })
             .ToListAsync();
 
-        var recent = await db.Leads.AsNoTracking()
-            .Where(l => l.IsActive && l.LeadDate >= from && l.LeadDate <= to)
+        var recent = await baseQuery
+            .Where(l => l.LeadDate >= from && l.LeadDate <= to)
             .OrderByDescending(l => l.LeadDate).ThenByDescending(l => l.LeadId)
             .Take(8)
             .Select(l => new LeadDto
@@ -110,22 +118,24 @@ public class DashboardController(CrmDbContext db) : ControllerBase
     [RequirePermission("dashboard", PermAction.View)]
     public async Task<ActionResult<List<int>>> Years()
     {
-        var years = await db.Leads.AsNoTracking().Where(l => l.IsActive)
+        var baseQuery = await ScopedLeadsAsync();
+        var years = await baseQuery
             .Select(l => l.LeadDate.Year).Distinct().OrderByDescending(y => y).ToListAsync();
 
         if (years.Count == 0) years.Add(DateTime.Today.Year);
         return Ok(years);
     }
 
-    private async Task<DashboardSummaryDto> BuildSummary(DateOnly from, DateOnly to)
+    private async Task<DashboardSummaryDto> BuildSummary(
+        IQueryable<Lead> baseQuery, DateOnly from, DateOnly to)
     {
-        var current = await Totals(from, to);
+        var current = await Totals(baseQuery, from, to);
 
         // Compare against the immediately preceding window of the same length.
         var lengthDays = to.DayNumber - from.DayNumber + 1;
         var prevTo = from.AddDays(-1);
         var prevFrom = prevTo.AddDays(-(lengthDays - 1));
-        var previous = await Totals(prevFrom, prevTo);
+        var previous = await Totals(baseQuery, prevFrom, prevTo);
 
         return new DashboardSummaryDto
         {
@@ -143,11 +153,9 @@ public class DashboardController(CrmDbContext db) : ControllerBase
         };
     }
 
-    private async Task<(int Leads, int Clients, int Rejected, int Pending, decimal Revenue)>
-        Totals(DateOnly from, DateOnly to)
+    private static async Task<(int Leads, int Clients, int Rejected, int Pending, decimal Revenue)>
+        Totals(IQueryable<Lead> active, DateOnly from, DateOnly to)
     {
-        var active = db.Leads.AsNoTracking().Where(l => l.IsActive);
-
         var leads = await active.CountAsync(l => l.LeadDate >= from && l.LeadDate <= to);
         var clients = await active.CountAsync(l => l.ConvertedDate >= from && l.ConvertedDate <= to);
         var rejected = await active.CountAsync(l => l.RejectedDate >= from && l.RejectedDate <= to);
@@ -159,17 +167,18 @@ public class DashboardController(CrmDbContext db) : ControllerBase
         return (leads, clients, rejected, pending, revenue);
     }
 
-    private async Task<List<MonthlyStatDto>> BuildTrend(DateOnly firstMonth, DateOnly lastMonth)
+    private static async Task<List<MonthlyStatDto>> BuildTrend(
+        IQueryable<Lead> baseQuery, DateOnly firstMonth, DateOnly lastMonth)
     {
         var rangeStart = firstMonth;
         var rangeEnd = lastMonth.AddMonths(1).AddDays(-1);
 
         // Pull the window once, then bucket in memory - 6 months is tiny.
-        var rows = await db.Leads.AsNoTracking()
-            .Where(l => l.IsActive
-                && ((l.LeadDate >= rangeStart && l.LeadDate <= rangeEnd)
+        var rows = await baseQuery
+            .Where(l =>
+                (l.LeadDate >= rangeStart && l.LeadDate <= rangeEnd)
                     || (l.ConvertedDate >= rangeStart && l.ConvertedDate <= rangeEnd)
-                    || (l.RejectedDate >= rangeStart && l.RejectedDate <= rangeEnd)))
+                    || (l.RejectedDate >= rangeStart && l.RejectedDate <= rangeEnd))
             .Select(l => new { l.LeadDate, l.ConvertedDate, l.RejectedDate, l.Status, l.DealValue })
             .ToListAsync();
 
